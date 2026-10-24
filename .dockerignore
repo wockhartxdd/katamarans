@@ -5,3 +5,4 @@ obj/
 evidence/
 *.md
 Dockerfile
+db-password.txt

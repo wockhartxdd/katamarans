@@ -1,77 +1,97 @@
+using Microsoft.EntityFrameworkCore;
+
 var builder = WebApplication.CreateBuilder(args);
+
+// Получаем настройки из переменных окружения (передаются через docker-compose)
+var dbHost = Environment.GetEnvironmentVariable("POSTGRES_SERVER") ?? "localhost";
+var dbName = Environment.GetEnvironmentVariable("POSTGRES_DB") ?? "app";
+var dbUser = Environment.GetEnvironmentVariable("POSTGRES_USER") ?? "postgres";
+var dbPassFile = Environment.GetEnvironmentVariable("POSTGRES_PASSWORD_FILE");
+
+// Читаем пароль из секрета (файла), если он передан, иначе дефолтный
+string dbPassword = "1234"; 
+if (!string.IsNullOrEmpty(dbPassFile) && File.Exists(dbPassFile))
+{
+    dbPassword = File.ReadAllText(dbPassFile).Trim();
+}
+
+var connectionString = $"Host={dbHost};Database={dbName};Username={dbUser};Password={dbPassword}";
+
+builder.Services.AddDbContext<AppDbContext>(options =>
+    options.UseNpgsql(connectionString));
+
 var app = builder.Build();
 
-// Каталог катамаранов (тестовые данные в памяти)
-var catamarans = new List<Catamaran>
+// Автоматическое применение миграций при старте (создание таблиц)
+using (var scope = app.Services.CreateScope())
 {
-    new(1, "Бриз",  "Прогулочный", 2, 500m),
-    new(2, "Волна", "Прогулочный", 4, 800m),
-    new(3, "Шторм", "Спортивный",  4, 950m),
-    new(4, "Чайка", "Семейный",    6, 1200m),
-    new(5, "Парус", "Спортивный",  2, 700m)
-};
+    var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    // Ждем немного, чтобы база данных успела подняться
+    for (int i = 0; i < 10; i++)
+    {
+        try
+        {
+            db.Database.EnsureCreated();
+            break;
+        }
+        catch (Exception)
+        {
+            Thread.Sleep(3000);
+        }
+    }
+}
 
-// Брони (в памяти)
-var bookings = new List<Booking>();
-var nextBookingId = 1;
+// Эндпоинты (CRUD)
+app.MapGet("/", () => Results.Ok(new { status = "ok" }));
 
-// Проверка работоспособности сервиса
-app.MapGet("/health", () => Results.Ok(new { status = "OK", service = "Catamaran Rental API" }));
+app.MapGet("/catamarans", async (AppDbContext db) =>
+    await db.Catamarans.ToListAsync());
 
-// GET /catamarans — список катамаранов
-app.MapGet("/catamarans", () => catamarans);
-
-// GET /catamarans/{id} — информация о катамаране
-app.MapGet("/catamarans/{id:int}", (int id) =>
-    catamarans.FirstOrDefault(c => c.Id == id) is { } c
-        ? Results.Ok(c)
-        : Results.NotFound(new { error = "Катамаран не найден" }));
-
-// POST /bookings — создать бронь
-app.MapPost("/bookings", (BookingRequest req) =>
+app.MapPost("/catamarans", async (Catamaran catamaran, AppDbContext db) =>
 {
-    var cat = catamarans.FirstOrDefault(c => c.Id == req.CatamaranId);
-    if (cat is null)
-        return Results.NotFound(new { error = "Катамаран не найден" });
-    if (req.Hours < 1)
-        return Results.BadRequest(new { error = "Минимальная длительность аренды — 1 час" });
-
-    var start = req.Time;
-    var end = start.AddHours(req.Hours);
-
-    // Проверка пересечения по времени с уже существующими бронями
-    var busy = bookings.Any(b => b.CatamaranId == req.CatamaranId
-                                 && b.Date == req.Date
-                                 && b.Status == "Подтверждена"
-                                 && start < b.Time.AddHours(b.Hours)
-                                 && b.Time < end);
-    if (busy)
-        return Results.Conflict(new { error = "Катамаран уже занят на это время" });
-
-    var booking = new Booking(nextBookingId++, req.CatamaranId, req.Date, req.Time,
-                              req.Hours, cat.PricePerHour * req.Hours, "Подтверждена");
-    bookings.Add(booking);
-    return Results.Created($"/bookings/{booking.Id}", booking);
+    db.Catamarans.Add(catamaran);
+    await db.SaveChangesAsync();
+    return Results.Created($"/catamarans/{catamaran.Id}", catamaran);
 });
 
-// GET /bookings/{id} — статус брони
-app.MapGet("/bookings/{id:int}", (int id) =>
-    bookings.FirstOrDefault(b => b.Id == id) is { } b
-        ? Results.Ok(b)
-        : Results.NotFound(new { error = "Бронь не найдена" }));
-
-// DELETE /bookings/{id} — отменить бронь
-app.MapDelete("/bookings/{id:int}", (int id) =>
+app.MapPut("/catamarans/{id}", async (int id, Catamaran inputCatamaran, AppDbContext db) =>
 {
-    var idx = bookings.FindIndex(b => b.Id == id);
-    if (idx < 0)
-        return Results.NotFound(new { error = "Бронь не найдена" });
-    bookings[idx] = bookings[idx] with { Status = "Отменена" };
-    return Results.Ok(bookings[idx]);
+    var catamaran = await db.Catamarans.FindAsync(id);
+    if (catamaran is null) return Results.NotFound();
+
+    catamaran.Name = inputCatamaran.Name;
+    catamaran.Capacity = inputCatamaran.Capacity;
+    catamaran.PricePerHour = inputCatamaran.PricePerHour;
+    catamaran.Status = inputCatamaran.Status;
+
+    await db.SaveChangesAsync();
+    return Results.NoContent();
+});
+
+app.MapDelete("/catamarans/{id}", async (int id, AppDbContext db) =>
+{
+    var catamaran = await db.Catamarans.FindAsync(id);
+    if (catamaran is null) return Results.NotFound();
+
+    db.Catamarans.Remove(catamaran);
+    await db.SaveChangesAsync();
+    return Results.Ok(new { message = "Deleted" });
 });
 
 app.Run();
 
-record Catamaran(int Id, string Name, string Type, int Seats, decimal PricePerHour);
-record BookingRequest(int CatamaranId, DateOnly Date, TimeOnly Time, int Hours);
-record Booking(int Id, int CatamaranId, DateOnly Date, TimeOnly Time, int Hours, decimal TotalPrice, string Status);
+// Модели данных
+public class Catamaran
+{
+    public int Id { get; set; }
+    public string Name { get; set; } = string.Empty;
+    public int Capacity { get; set; }
+    public decimal PricePerHour { get; set; }
+    public string Status { get; set; } = "available";
+}
+
+public class AppDbContext : DbContext
+{
+    public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }
+    public DbSet<Catamaran> Catamarans => Set<Catamaran>();
+}
